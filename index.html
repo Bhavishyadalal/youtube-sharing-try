@@ -146,26 +146,6 @@
         @media (prefers-reduced-motion: reduce) {
             .ambient-blob, .ember { animation: none; }
         }
-        /* Blur-heavy full-screen animation is the costliest thing on this page for
-           weaker mobile GPUs, and it was running unbounded — this is the actual
-           mobile playback-stall fix: it competes with the video decoder for the
-           same limited resources the whole time it's animating. On phones: drop
-           one blob entirely, shrink the blur radius on the rest, and let JS pause
-           everything outright when the tab isn't visible. */
-        @media (max-width: 640px) {
-            .ambient-blob { filter: blur(46px); }
-            .ambient-blob.b3 { display: none; }
-        }
-        .page-hidden .ambient-blob,
-        .page-hidden .ember { animation-play-state: paused; }
-        /* On phones specifically, also pause the ambient animation while the
-           video is actively playing — that's exactly when it's competing with
-           the video decoder for the same limited GPU/CPU, which is the likely
-           cause of "plays a few seconds then stalls." */
-        @media (max-width: 640px) {
-            .video-playing .ambient-blob,
-            .video-playing .ember { animation-play-state: paused; }
-        }
 
         /* ---------- Marquee header ---------- */
         .marquee-bar {
@@ -311,16 +291,6 @@
         .screen-frame::after {
             content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 3;
             box-shadow: inset 0 0 90px 20px rgba(0,0,0,0.55);
-        }
-        .stuck-buffer-hint {
-            display: none; position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
-            z-index: 4; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 999px;
-            background: rgba(4,4,8,0.85); border: 1px solid var(--border); color: var(--text);
-            font-size: 12.5px; backdrop-filter: blur(6px); max-width: calc(100% - 32px);
-        }
-        .stuck-buffer-hint button {
-            background: var(--marquee); color: var(--marquee-ink, #1a1a1a); border: none; cursor: pointer;
-            padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
         }
 
         .icon-btn {
@@ -1103,12 +1073,7 @@
     /* ================= Peer connection (5-digit room codes) ================= */
     let player, conn, peer;
     let queue = [];
-    let syncGeneration = 0;          // bumped every time we apply a remote sync
-    let ignoreStateChangeGen = -1;   // the generation our next own state-change event should be ignored for
-    const SYNC_DRIFT_THRESHOLD = 2;  // seconds — only hard-seek if actually this far off
-    const STUCK_BUFFER_MS = 9000;    // how long BUFFERING can sit before we offer a retry
-    let bufferingSinceTs = 0;
-    let stuckCheckHandle = null;
+    let suppressUntil = 0;
     let currentVideoId = null;
     let playerReady = false;
 
@@ -1168,8 +1133,9 @@
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
             { urls: 'stun:stun.cloudflare.com:3478' },
-            { urls: 'turn:free.expressturn.com:3478', username: '000000002101431517', credential: 'st6pOqjUb+CM0yv4KlKHWGoLu7s=' },
-            { urls: 'turn:free.expressturn.com:3478?transport=tcp', username: '000000002101431517', credential: 'st6pOqjUb+CM0yv4KlKHWGoLu7s=' }
+            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+            { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+            { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
         ]
     };
 
@@ -1273,17 +1239,7 @@
     function onYouTubeIframeAPIReady() {
         player = new YT.Player('yt-player', {
             videoId: 'dQw4w9WgXcQ',
-            playerVars: {
-                'enablejsapi': 1,
-                'origin': window.location.origin,
-                // playsinline is the fix for the mobile "plays a few seconds then
-                // hangs" bug: without it, mobile browsers (iOS Safari especially)
-                // don't reliably keep the video under the JS API's control once
-                // playback is driven programmatically (e.g. by a sync message)
-                // rather than by a direct tap on the player itself.
-                'playsinline': 1,
-                'rel': 0
-            },
+            playerVars: { 'enablejsapi': 1, 'origin': window.location.origin },
             events: {
                 onStateChange: onPlayerStateChange,
                 onReady: () => { playerReady = true; },
@@ -1313,52 +1269,8 @@
     }
 
     /* ================= Sync: play / pause / seek mirror both ways ================= */
-    let videoPlayingClassTimer = null;
-    // Pausing the ambient blob/ember animation on 'video-playing' is what fixed
-    // the mid-playback mobile stall — but toggling it *instantly* on PLAYING
-    // forced a style recalc across every animated element in the same frame the
-    // video itself was trying to start, which is what caused the new click-to-play
-    // delay. The first ~500ms of playback was never the contention problem —
-    // sustained animation *during* playback was — so delay applying the pause
-    // that long, and let anything mid-flight get cancelled if state flips again
-    // before it lands. Resuming (un-pausing) on stop/pause stays instant since
-    // that direction was never time-sensitive.
-    function setVideoPlayingClass(isPlaying) {
-        if (videoPlayingClassTimer) {
-            clearTimeout(videoPlayingClassTimer);
-            videoPlayingClassTimer = null;
-        }
-        if (isPlaying) {
-            videoPlayingClassTimer = setTimeout(() => {
-                document.body.classList.add('video-playing');
-                videoPlayingClassTimer = null;
-            }, 500);
-        } else {
-            document.body.classList.remove('video-playing');
-        }
-    }
-
     function onPlayerStateChange(e) {
-        if (e.data === YT.PlayerState.BUFFERING) {
-            // Buffering is an intermediate state, not a settled one — arm the
-            // stuck-buffer watch, but don't touch the echo-guard flag here.
-            // Doing so was the actual remaining bug: it consumed the "ignore
-            // next state change" token on this intermediate event, so by the
-            // time the real PLAYING arrived (after buffering finished), the
-            // guard was already gone and it re-echoed a sync right as
-            // playback was trying to settle — retriggering another
-            // play/pause cycle exactly when it needed to be left alone.
-            armStuckBufferWatch();
-            return;
-        }
-        if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
-            clearStuckBufferWatch();
-            setVideoPlayingClass(e.data === YT.PlayerState.PLAYING);
-            if (ignoreStateChangeGen === syncGeneration) {
-                ignoreStateChangeGen = -1;
-                return;
-            }
-        }
+        if (Date.now() < suppressUntil) return;
         if (e.data === YT.PlayerState.PLAYING) {
             safeSend({ type: 'sync', action: 'play', time: player.getCurrentTime() });
         } else if (e.data === YT.PlayerState.PAUSED) {
@@ -1368,61 +1280,9 @@
         }
     }
 
-    // If BUFFERING sits for too long with nothing else happening, offer a manual
-    // recovery instead of failing silently forever — this is a real fallback for
-    // a genuinely too-slow connection, not something the sync logic can fix.
-    function armStuckBufferWatch() {
-        clearStuckBufferWatch();
-        bufferingSinceTs = Date.now();
-        stuckCheckHandle = setTimeout(() => {
-            if (!player || typeof player.getPlayerState !== 'function') return;
-            if (player.getPlayerState() === YT.PlayerState.BUFFERING) showStuckBufferHint();
-        }, STUCK_BUFFER_MS);
-    }
-    function clearStuckBufferWatch() {
-        if (stuckCheckHandle) clearTimeout(stuckCheckHandle);
-        stuckCheckHandle = null;
-        hideStuckBufferHint();
-    }
-    function showStuckBufferHint() {
-        let hint = document.getElementById('stuck-buffer-hint');
-        if (!hint) {
-            hint = document.createElement('div');
-            hint.id = 'stuck-buffer-hint';
-            hint.className = 'stuck-buffer-hint';
-            hint.innerHTML = 'Still loading — this can happen on a slow connection. ' +
-                '<button onclick="retryStuckPlayback()">Tap to retry</button>';
-            const frame = document.getElementById('screen-frame') || document.querySelector('.screen-frame');
-            if (frame) frame.appendChild(hint);
-        }
-        hint.style.display = 'flex';
-    }
-    function hideStuckBufferHint() {
-        const hint = document.getElementById('stuck-buffer-hint');
-        if (hint) hint.style.display = 'none';
-    }
-    function retryStuckPlayback() {
-        hideStuckBufferHint();
-        if (!player || typeof player.getCurrentTime !== 'function') return;
-        // Re-seeking to the current position (rather than a stale synced one)
-        // nudges a stalled connection to re-request from where it actually is.
-        const t = player.getCurrentTime();
-        player.seekTo(t, true);
-        player.playVideo();
-    }
-
     function applyRemoteSync(action, time) {
-        if (!player || typeof player.getCurrentTime !== 'function') return;
-        syncGeneration++;
-        ignoreStateChangeGen = syncGeneration;
-        // Only hard-seek when actually meaningfully off — an unconditional seek on
-        // every sync message was the main cause of the mobile-data stall: it threw
-        // away buffer that was already building, every single time, even when the
-        // position barely needed correcting.
-        const current = player.getCurrentTime();
-        if (typeof time === 'number' && Math.abs(current - time) > SYNC_DRIFT_THRESHOLD) {
-            player.seekTo(time, true);
-        }
+        suppressUntil = Date.now() + 1200;
+        player.seekTo(time, true);
         if (action === 'play') player.playVideo();
         else if (action === 'pause') player.pauseVideo();
         // 'seek' (from the ±10s buttons) just moves the playhead and leaves play state as-is.
@@ -1431,8 +1291,7 @@
     function skipBy(seconds) {
         if (!player || typeof player.getCurrentTime !== 'function') return;
         const newTime = Math.max(0, player.getCurrentTime() + seconds);
-        syncGeneration++;
-        ignoreStateChangeGen = syncGeneration;
+        suppressUntil = Date.now() + 1200;
         player.seekTo(newTime, true);
         safeSend({ type: 'sync', action: 'seek', time: newTime });
     }
@@ -1670,16 +1529,9 @@
             safeSend({ type: 'nickname', name: nickname });
             safeSend({ type: 'queue_sync', queue: queue });
             if (currentVideoId) safeSend({ type: 'video', id: currentVideoId });
-            // A short stagger before the sync message: on a fresh join, cueVideoById
-            // needs a moment to actually initialize before it's ready to accept a
-            // seek — sending sync in the same instant risked the seek landing before
-            // the cue had settled, especially over a slower mobile connection.
             if (playerReady && player && typeof player.getCurrentTime === 'function') {
                 const isPlaying = typeof player.getPlayerState === 'function' && player.getPlayerState() === YT.PlayerState.PLAYING;
-                const t = player.getCurrentTime();
-                setTimeout(() => {
-                    safeSend({ type: 'sync', action: isPlaying ? 'play' : 'pause', time: t });
-                }, currentVideoId ? 600 : 0);
+                safeSend({ type: 'sync', action: isPlaying ? 'play' : 'pause', time: player.getCurrentTime() });
             }
         });
         conn.on('close', handleConnClose);
@@ -2329,19 +2181,8 @@
 
     /* ================= Cozy ambient embers ================= */
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const isSmallScreen = window.matchMedia('(max-width: 640px)').matches;
-    // Phones get fewer, slower embers — this was running unbounded before (a new
-    // ember every 1.4s, each alive 14-26s = 10-18+ animated nodes at all times,
-    // forever, on every device including weak ones, competing with the video
-    // decoder for the same GPU/CPU the whole time it runs). Cap concurrency and
-    // slow the spawn rate on small screens instead.
-    const EMBER_CAP = isSmallScreen ? 5 : 14;
-    const EMBER_INTERVAL_MS = isSmallScreen ? 2600 : 1400;
-    let emberCount = 0;
     function spawnEmber() {
-        if (reduceMotion || document.hidden) return;
-        if (isSmallScreen && document.body.classList.contains('video-playing')) return;
-        if (emberCount >= EMBER_CAP) return;
+        if (reduceMotion) return;
         const field = document.getElementById('ember-field');
         const el = document.createElement('div');
         const size = 3 + Math.random() * 5;
@@ -2353,21 +2194,12 @@
         const duration = 14 + Math.random() * 12;
         el.style.animationDuration = duration + 's';
         field.appendChild(el);
-        emberCount++;
-        setTimeout(() => { el.remove(); emberCount--; }, duration * 1000 + 200);
+        setTimeout(() => el.remove(), duration * 1000 + 200);
     }
     if (!reduceMotion) {
-        const initialCount = isSmallScreen ? 4 : 10;
-        for (let i = 0; i < initialCount; i++) setTimeout(spawnEmber, i * 900);
-        setInterval(spawnEmber, EMBER_INTERVAL_MS);
+        for (let i = 0; i < 10; i++) setTimeout(spawnEmber, i * 900);
+        setInterval(spawnEmber, 1400);
     }
-
-    // Pause all ambient animation work outright when the tab isn't visible — no
-    // point burning battery/CPU animating blurred blobs nobody can see, and it
-    // frees up the main thread (and the video decoder) when it matters most.
-    document.addEventListener('visibilitychange', () => {
-        document.body.classList.toggle('page-hidden', document.hidden);
-    });
 
     /* =========================
        Call feature implementation
