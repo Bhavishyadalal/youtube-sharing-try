@@ -13,6 +13,7 @@
             --bg: #090a0f;
             --surface: rgba(255, 255, 255, 0.045);
             --surface-hi: rgba(255, 255, 255, 0.08);
+            --surface-perf: rgba(9, 10, 15, 0.86);
             --border: rgba(255, 255, 255, 0.09);
             --text: #f6f3ec;
             --text-dim: rgba(246, 243, 236, 0.56);
@@ -315,11 +316,28 @@
             background: var(--surface); backdrop-filter: blur(20px);
             border: 1px solid var(--border); border-radius: 18px;
         }
+        /* backdrop-filter is the other big mobile GPU cost alongside the blurred
+           ambient blobs above — every .glass panel re-samples everything behind
+           it, every frame, for as long as it's on screen. At 1080p the video
+           decoder already has little headroom left on a phone, so drop the blur
+           entirely (swap to a plain, near-opaque background instead — still
+           reads as a solid dark panel) specifically while a video is playing on
+           a small screen. Desktop and paused/no-video states are untouched. */
+        @media (max-width: 640px) {
+            .video-playing .glass {
+                backdrop-filter: none;
+                background: var(--surface-perf);
+            }
+        }
 
         .screen-frame {
             background: var(--film); border-radius: 18px; padding: 0;
             overflow: hidden; border: 1px solid var(--border);
             position: relative;
+            /* Gives the player its own GPU compositing layer, separate from the
+               blurred panels around it, so the browser isn't tempted to repaint
+               them together on every video frame. */
+            transform: translateZ(0);
         }
         .screen-frame::after {
             content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 3;
