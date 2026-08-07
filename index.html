@@ -297,7 +297,20 @@
             display: grid; grid-template-columns: 1fr 360px; gap: 26px;
             padding: 28px 32px 40px; max-width: 1500px; margin: 0 auto; align-items: start;
         }
-
+        /* THE actual fix for the page-wide horizontal blowout: a grid item's default
+           min-width is "auto", which resolves to the min-content size of everything
+           inside it — including a horizontally-scrolling row of fixed-width cards,
+           whose min-content is the sum of every card's width. Without this, adding
+           enough related-video chips forces .main-col (and therefore the whole grid,
+           and therefore the whole page) to stretch to fit them all in one line
+           instead of letting the row scroll internally. min-width: 0 is the standard,
+           correct override — it's what lets .reel-track's own overflow-x: auto
+           actually do its job instead of being fought by its ancestor. */
+        .main-col { min-width: 0; }
+        /* Defensive backstop: even if some future element reintroduces this bug,
+           the page itself should never gain a horizontal scrollbar — only individual
+           rows should. */
+        html, body { overflow-x: hidden; }
         .glass {
             background: var(--surface); backdrop-filter: blur(20px);
             border: 1px solid var(--border); border-radius: 18px;
@@ -513,14 +526,34 @@
         .reel-heading { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
         .reel-heading h2 { font-size: 18px; color: var(--text-dim); }
         .reel-heading span { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.12em; }
-        .reel-track { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 6px; }
+        /* Wraps the scrolling track so the nav arrows can sit on top of it without
+           adding to the row's own layout width (that's what caused the blowout). */
+        .track-wrap { position: relative; }
+        .reel-track {
+            display: flex; gap: 12px; overflow-x: auto; padding-bottom: 6px;
+            scroll-behavior: smooth; scroll-snap-type: x proximity;
+        }
         .reel-track::-webkit-scrollbar { height: 6px; }
         .reel-track::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        .track-nav {
+            position: absolute; top: 0; bottom: 6px; width: 34px; z-index: 2;
+            display: flex; align-items: center; justify-content: center; border: none; cursor: pointer;
+            background: linear-gradient(90deg, var(--film) 0%, transparent 100%);
+            color: var(--text); opacity: 0; transition: opacity 0.2s; padding: 0;
+        }
+        .track-nav svg { width: 18px; height: 18px; filter: drop-shadow(0 1px 3px rgba(0,0,0,0.6)); }
+        .track-nav.prev { left: 0; }
+        .track-nav.next { right: 0; background: linear-gradient(270deg, var(--film) 0%, transparent 100%); }
+        .track-wrap:hover .track-nav, .track-wrap:focus-within .track-nav { opacity: 1; }
+        /* Touch devices have no ':hover' to reveal these on — keep them visible
+           there so mobile users always have a tap target, not just drag-scroll. */
+        @media (hover: none) { .track-nav { opacity: 0.85; } }
         .reel-chip {
             flex: 0 0 auto; width: 168px; display: flex; flex-direction: column;
             border-radius: 12px; border: 1px solid var(--border);
             background: rgba(255,255,255,0.02); cursor: pointer; overflow: hidden;
             transition: 0.25s cubic-bezier(0.2, 0.8, 0.2, 1); position: relative;
+            scroll-snap-align: start;
         }
         .reel-chip:hover { border-color: var(--marquee); transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,0.35), 0 0 0 1px var(--marquee-soft); }
         .reel-chip.dragging { opacity: 0.4; border-color: var(--marquee); cursor: grabbing; }
@@ -813,6 +846,8 @@
             .emoji-panel { width: 260px; left: auto; right: -46px; }
             .emoji-panel.open { transform: translateY(0) scale(1); }
             .reaction-dock { bottom: 16px; padding: 8px 10px; gap: 8px; }
+            .reel-chip { width: 132px; }
+            .track-nav { width: 28px; }
         }
         @media (max-width: 600px) {
             .wordmark h1 { font-size: 24px; }
@@ -1002,8 +1037,16 @@
                     <h2>Up Next</h2>
                     <span id="reel-count">0 in reel</span>
                 </div>
-                <div class="reel-track" id="reel-track">
-                    <div class="reel-empty">Queued clips will line up here — tap one to jump right to it.</div>
+                <div class="track-wrap">
+                    <button class="track-nav prev" onclick="scrollTrack('reel-track', -1)" aria-label="Scroll left" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                    </button>
+                    <div class="reel-track" id="reel-track">
+                        <div class="reel-empty">Queued clips will line up here — tap one to jump right to it.</div>
+                    </div>
+                    <button class="track-nav next" onclick="scrollTrack('reel-track', 1)" aria-label="Scroll right" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
                 </div>
             </div>
 
@@ -1016,8 +1059,16 @@
                     <h2>You Might Also Like</h2>
                     <span id="related-count"></span>
                 </div>
-                <div class="reel-track" id="related-track">
-                    <div class="reel-empty">Load a video and related picks will show up here.</div>
+                <div class="track-wrap">
+                    <button class="track-nav prev" onclick="scrollTrack('related-track', -1)" aria-label="Scroll left" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                    </button>
+                    <div class="reel-track" id="related-track">
+                        <div class="reel-empty">Load a video and related picks will show up here.</div>
+                    </div>
+                    <button class="track-nav next" onclick="scrollTrack('related-track', 1)" aria-label="Scroll right" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
                 </div>
             </div>
         </div>
@@ -1546,8 +1597,17 @@
         safeSend({ type: 'sync', action: 'seek', time: newTime });
     }
 
-    function updateNowShowing(title, videoId) {
-        const el = document.getElementById('now-showing');
+    // Slide navigation for the horizontally-scrolling strips (queue + related).
+    // Scrolls by ~80% of the visible width per tap — feels like a "slide" rather
+    // than a jarring full-row jump, and CSS scroll-snap settles it on a card edge.
+    function scrollTrack(trackId, dir) {
+        const el = document.getElementById(trackId);
+        if (!el) return;
+        const amount = Math.round(el.clientWidth * 0.8) * dir;
+        el.scrollBy({ left: amount, behavior: 'smooth' });
+    }
+
+    function updateNowShowing(title, videoId) {        const el = document.getElementById('now-showing');
         if (el) el.innerText = title ? ('Now showing — ' + title) : '';
         if (videoId) loadRelatedVideos(videoId, title);
     }
