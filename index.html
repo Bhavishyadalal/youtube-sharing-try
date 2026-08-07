@@ -1313,6 +1313,31 @@
     }
 
     /* ================= Sync: play / pause / seek mirror both ways ================= */
+    let videoPlayingClassTimer = null;
+    // Pausing the ambient blob/ember animation on 'video-playing' is what fixed
+    // the mid-playback mobile stall — but toggling it *instantly* on PLAYING
+    // forced a style recalc across every animated element in the same frame the
+    // video itself was trying to start, which is what caused the new click-to-play
+    // delay. The first ~500ms of playback was never the contention problem —
+    // sustained animation *during* playback was — so delay applying the pause
+    // that long, and let anything mid-flight get cancelled if state flips again
+    // before it lands. Resuming (un-pausing) on stop/pause stays instant since
+    // that direction was never time-sensitive.
+    function setVideoPlayingClass(isPlaying) {
+        if (videoPlayingClassTimer) {
+            clearTimeout(videoPlayingClassTimer);
+            videoPlayingClassTimer = null;
+        }
+        if (isPlaying) {
+            videoPlayingClassTimer = setTimeout(() => {
+                document.body.classList.add('video-playing');
+                videoPlayingClassTimer = null;
+            }, 500);
+        } else {
+            document.body.classList.remove('video-playing');
+        }
+    }
+
     function onPlayerStateChange(e) {
         if (e.data === YT.PlayerState.BUFFERING) {
             // Buffering is an intermediate state, not a settled one — arm the
@@ -1328,7 +1353,7 @@
         }
         if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
             clearStuckBufferWatch();
-            document.body.classList.toggle('video-playing', e.data === YT.PlayerState.PLAYING);
+            setVideoPlayingClass(e.data === YT.PlayerState.PLAYING);
             if (ignoreStateChangeGen === syncGeneration) {
                 ignoreStateChangeGen = -1;
                 return;
