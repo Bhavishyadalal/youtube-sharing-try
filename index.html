@@ -1294,24 +1294,29 @@
 
     /* ================= Sync: play / pause / seek mirror both ways ================= */
     function onPlayerStateChange(e) {
-        // Generation-based echo guard: only ignore the state change we know is the
-        // direct result of our own last applyRemoteSync() call — not "anything
-        // within N ms," which used to race against slow mobile-data buffering and
-        // cause an echo (and repeated forced re-seeks that could wipe out a phone's
-        // buffer over and over, turning a normal rebuffer into a permanent stall).
+        if (e.data === YT.PlayerState.BUFFERING) {
+            // Buffering is an intermediate state, not a settled one — arm the
+            // stuck-buffer watch, but don't touch the echo-guard flag here.
+            // Doing so was the actual remaining bug: it consumed the "ignore
+            // next state change" token on this intermediate event, so by the
+            // time the real PLAYING arrived (after buffering finished), the
+            // guard was already gone and it re-echoed a sync right as
+            // playback was trying to settle — retriggering another
+            // play/pause cycle exactly when it needed to be left alone.
+            armStuckBufferWatch();
+            return;
+        }
         if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
             clearStuckBufferWatch();
-        }
-        if (ignoreStateChangeGen === syncGeneration) {
-            ignoreStateChangeGen = -1;
-            return;
+            if (ignoreStateChangeGen === syncGeneration) {
+                ignoreStateChangeGen = -1;
+                return;
+            }
         }
         if (e.data === YT.PlayerState.PLAYING) {
             safeSend({ type: 'sync', action: 'play', time: player.getCurrentTime() });
         } else if (e.data === YT.PlayerState.PAUSED) {
             safeSend({ type: 'sync', action: 'pause', time: player.getCurrentTime() });
-        } else if (e.data === YT.PlayerState.BUFFERING) {
-            armStuckBufferWatch();
         } else if (e.data === YT.PlayerState.ENDED) {
             playNextInQueue();
         }
