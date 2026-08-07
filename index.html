@@ -1253,7 +1253,17 @@
     function onYouTubeIframeAPIReady() {
         player = new YT.Player('yt-player', {
             videoId: 'dQw4w9WgXcQ',
-            playerVars: { 'enablejsapi': 1, 'origin': window.location.origin },
+            playerVars: {
+                'enablejsapi': 1,
+                'origin': window.location.origin,
+                // playsinline is the fix for the mobile "plays a few seconds then
+                // hangs" bug: without it, mobile browsers (iOS Safari especially)
+                // don't reliably keep the video under the JS API's control once
+                // playback is driven programmatically (e.g. by a sync message)
+                // rather than by a direct tap on the player itself.
+                'playsinline': 1,
+                'rel': 0
+            },
             events: {
                 onStateChange: onPlayerStateChange,
                 onReady: () => { playerReady = true; },
