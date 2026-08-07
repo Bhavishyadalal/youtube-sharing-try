@@ -146,6 +146,26 @@
         @media (prefers-reduced-motion: reduce) {
             .ambient-blob, .ember { animation: none; }
         }
+        /* Blur-heavy full-screen animation is the costliest thing on this page for
+           weaker mobile GPUs, and it was running unbounded — this is the actual
+           mobile playback-stall fix: it competes with the video decoder for the
+           same limited resources the whole time it's animating. On phones: drop
+           one blob entirely, shrink the blur radius on the rest, and let JS pause
+           everything outright when the tab isn't visible. */
+        @media (max-width: 640px) {
+            .ambient-blob { filter: blur(46px); }
+            .ambient-blob.b3 { display: none; }
+        }
+        .page-hidden .ambient-blob,
+        .page-hidden .ember { animation-play-state: paused; }
+        /* On phones specifically, also pause the ambient animation while the
+           video is actively playing — that's exactly when it's competing with
+           the video decoder for the same limited GPU/CPU, which is the likely
+           cause of "plays a few seconds then stalls." */
+        @media (max-width: 640px) {
+            .video-playing .ambient-blob,
+            .video-playing .ember { animation-play-state: paused; }
+        }
 
         /* ---------- Marquee header ---------- */
         .marquee-bar {
@@ -291,6 +311,35 @@
         .screen-frame::after {
             content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 3;
             box-shadow: inset 0 0 90px 20px rgba(0,0,0,0.55);
+        }
+        .stuck-buffer-hint {
+            display: none; position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+            z-index: 4; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 999px;
+            background: rgba(4,4,8,0.85); border: 1px solid var(--border); color: var(--text);
+            font-size: 12.5px; backdrop-filter: blur(6px); max-width: calc(100% - 32px);
+        }
+        .stuck-buffer-hint button {
+            background: var(--marquee); color: var(--marquee-ink, #1a1a1a); border: none; cursor: pointer;
+            padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
+        }
+
+        /* "Play Together" countdown — shown on both screens at once, counting down
+           to the same agreed wall-clock target so playback starts together. */
+        .play-together-overlay {
+            display: none; position: absolute; inset: 0; z-index: 5;
+            align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+            background: rgba(4,4,8,0.72); backdrop-filter: blur(3px);
+        }
+        .play-together-overlay.active { display: flex; }
+        .play-together-number {
+            font-family: 'Bebas Neue', sans-serif; font-size: clamp(64px, 16vw, 140px);
+            line-height: 1; color: var(--marquee); text-shadow: 0 0 40px var(--marquee-soft);
+            animation: playTogetherPop 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+        @keyframes playTogetherPop { 0% { transform: scale(0.5); opacity: 0; } 60% { transform: scale(1.12); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }
+        .play-together-label {
+            font-family: 'Inter', sans-serif; font-size: 13px; letter-spacing: 0.06em;
+            text-transform: uppercase; color: var(--text-dim);
         }
 
         .icon-btn {
@@ -928,6 +977,10 @@
                 <div class="sprocket-strip"></div>
                 <div id="yt-player"></div>
                 <div class="sprocket-strip"></div>
+                <div class="play-together-overlay" id="play-together-overlay" aria-hidden="true">
+                    <div class="play-together-number" id="play-together-number">3</div>
+                    <div class="play-together-label">Starting together…</div>
+                </div>
             </div>
 
             <div class="glass controls" id="controls">
@@ -938,7 +991,8 @@
                 <button class="skip-btn" onclick="skipBy(10)" title="Forward 10 seconds" aria-label="Forward 10 seconds">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 19 22 12 13 5 13 19"/><polygon points="2 19 11 12 2 5 2 19"/></svg>
                 </button>
-                <button class="btn btn-primary" onclick="loadVideo()">Play</button>
+                <button class="btn btn-ghost" onclick="loadVideo()">Load</button>
+                <button class="btn btn-primary" id="play-together-btn" onclick="playTogether()" title="Both of you start at the exact same moment">▶ Play Together</button>
                 <button class="btn btn-ghost" onclick="addToQueue()">Queue</button>
                 <button class="btn btn-ghost" onclick="openSearchModal()" title="Search YouTube">🔍 Search</button>
             </div>
@@ -950,6 +1004,20 @@
                 </div>
                 <div class="reel-track" id="reel-track">
                     <div class="reel-empty">Queued clips will line up here — tap one to jump right to it.</div>
+                </div>
+            </div>
+
+            <!-- Our own related-videos strip — replaces relying on YouTube's in-player
+                 suggestions overlay, whose thumbnails open youtube.com in a new tab and
+                 can't be intercepted (cross-origin iframe, no API for it). Clicking one
+                 of these plays it right here instead, same as Search does. -->
+            <div class="glass reel-section" id="related-section">
+                <div class="reel-heading">
+                    <h2>You Might Also Like</h2>
+                    <span id="related-count"></span>
+                </div>
+                <div class="reel-track" id="related-track">
+                    <div class="reel-empty">Load a video and related picks will show up here.</div>
                 </div>
             </div>
         </div>
@@ -1073,7 +1141,12 @@
     /* ================= Peer connection (5-digit room codes) ================= */
     let player, conn, peer;
     let queue = [];
-    let suppressUntil = 0;
+    let syncGeneration = 0;          // bumped every time we apply a remote sync
+    let ignoreStateChangeGen = -1;   // the generation our next own state-change event should be ignored for
+    const SYNC_DRIFT_THRESHOLD = 2;  // seconds — only hard-seek if actually this far off
+    const STUCK_BUFFER_MS = 9000;    // how long BUFFERING can sit before we offer a retry
+    let bufferingSinceTs = 0;
+    let stuckCheckHandle = null;
     let currentVideoId = null;
     let playerReady = false;
 
@@ -1133,9 +1206,8 @@
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
             { urls: 'stun:stun.cloudflare.com:3478' },
-            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-            { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-            { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+            { urls: 'turn:free.expressturn.com:3478', username: '000000002101431517', credential: 'st6pOqjUb+CM0yv4KlKHWGoLu7s=' },
+            { urls: 'turn:free.expressturn.com:3478?transport=tcp', username: '000000002101431517', credential: 'st6pOqjUb+CM0yv4KlKHWGoLu7s=' }
         ]
     };
 
@@ -1239,7 +1311,17 @@
     function onYouTubeIframeAPIReady() {
         player = new YT.Player('yt-player', {
             videoId: 'dQw4w9WgXcQ',
-            playerVars: { 'enablejsapi': 1, 'origin': window.location.origin },
+            playerVars: {
+                'enablejsapi': 1,
+                'origin': window.location.origin,
+                // playsinline is the fix for the mobile "plays a few seconds then
+                // hangs" bug: without it, mobile browsers (iOS Safari especially)
+                // don't reliably keep the video under the JS API's control once
+                // playback is driven programmatically (e.g. by a sync message)
+                // rather than by a direct tap on the player itself.
+                'playsinline': 1,
+                'rel': 0
+            },
             events: {
                 onStateChange: onPlayerStateChange,
                 onReady: () => { playerReady = true; },
@@ -1269,8 +1351,52 @@
     }
 
     /* ================= Sync: play / pause / seek mirror both ways ================= */
+    let videoPlayingClassTimer = null;
+    // Pausing the ambient blob/ember animation on 'video-playing' is what fixed
+    // the mid-playback mobile stall — but toggling it *instantly* on PLAYING
+    // forced a style recalc across every animated element in the same frame the
+    // video itself was trying to start, which is what caused the new click-to-play
+    // delay. The first ~500ms of playback was never the contention problem —
+    // sustained animation *during* playback was — so delay applying the pause
+    // that long, and let anything mid-flight get cancelled if state flips again
+    // before it lands. Resuming (un-pausing) on stop/pause stays instant since
+    // that direction was never time-sensitive.
+    function setVideoPlayingClass(isPlaying) {
+        if (videoPlayingClassTimer) {
+            clearTimeout(videoPlayingClassTimer);
+            videoPlayingClassTimer = null;
+        }
+        if (isPlaying) {
+            videoPlayingClassTimer = setTimeout(() => {
+                document.body.classList.add('video-playing');
+                videoPlayingClassTimer = null;
+            }, 500);
+        } else {
+            document.body.classList.remove('video-playing');
+        }
+    }
+
     function onPlayerStateChange(e) {
-        if (Date.now() < suppressUntil) return;
+        if (e.data === YT.PlayerState.BUFFERING) {
+            // Buffering is an intermediate state, not a settled one — arm the
+            // stuck-buffer watch, but don't touch the echo-guard flag here.
+            // Doing so was the actual remaining bug: it consumed the "ignore
+            // next state change" token on this intermediate event, so by the
+            // time the real PLAYING arrived (after buffering finished), the
+            // guard was already gone and it re-echoed a sync right as
+            // playback was trying to settle — retriggering another
+            // play/pause cycle exactly when it needed to be left alone.
+            armStuckBufferWatch();
+            return;
+        }
+        if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
+            clearStuckBufferWatch();
+            setVideoPlayingClass(e.data === YT.PlayerState.PLAYING);
+            if (ignoreStateChangeGen === syncGeneration) {
+                ignoreStateChangeGen = -1;
+                return;
+            }
+        }
         if (e.data === YT.PlayerState.PLAYING) {
             safeSend({ type: 'sync', action: 'play', time: player.getCurrentTime() });
         } else if (e.data === YT.PlayerState.PAUSED) {
@@ -1280,26 +1406,216 @@
         }
     }
 
+    // If BUFFERING sits for too long with nothing else happening, offer a manual
+    // recovery instead of failing silently forever — this is a real fallback for
+    // a genuinely too-slow connection, not something the sync logic can fix.
+    function armStuckBufferWatch() {
+        clearStuckBufferWatch();
+        bufferingSinceTs = Date.now();
+        stuckCheckHandle = setTimeout(() => {
+            if (!player || typeof player.getPlayerState !== 'function') return;
+            if (player.getPlayerState() === YT.PlayerState.BUFFERING) showStuckBufferHint();
+        }, STUCK_BUFFER_MS);
+    }
+    function clearStuckBufferWatch() {
+        if (stuckCheckHandle) clearTimeout(stuckCheckHandle);
+        stuckCheckHandle = null;
+        hideStuckBufferHint();
+    }
+    function showStuckBufferHint() {
+        let hint = document.getElementById('stuck-buffer-hint');
+        if (!hint) {
+            hint = document.createElement('div');
+            hint.id = 'stuck-buffer-hint';
+            hint.className = 'stuck-buffer-hint';
+            hint.innerHTML = 'Still loading — this can happen on a slow connection. ' +
+                '<button onclick="retryStuckPlayback()">Tap to retry</button>';
+            const frame = document.getElementById('screen-frame') || document.querySelector('.screen-frame');
+            if (frame) frame.appendChild(hint);
+        }
+        hint.style.display = 'flex';
+    }
+    function hideStuckBufferHint() {
+        const hint = document.getElementById('stuck-buffer-hint');
+        if (hint) hint.style.display = 'none';
+    }
+    function retryStuckPlayback() {
+        hideStuckBufferHint();
+        if (!player || typeof player.getCurrentTime !== 'function') return;
+        // Re-seeking to the current position (rather than a stale synced one)
+        // nudges a stalled connection to re-request from where it actually is.
+        const t = player.getCurrentTime();
+        player.seekTo(t, true);
+        player.playVideo();
+    }
+
     function applyRemoteSync(action, time) {
-        suppressUntil = Date.now() + 1200;
-        player.seekTo(time, true);
+        if (!player || typeof player.getCurrentTime !== 'function') return;
+        syncGeneration++;
+        ignoreStateChangeGen = syncGeneration;
+        // Only hard-seek when actually meaningfully off — an unconditional seek on
+        // every sync message was the main cause of the mobile-data stall: it threw
+        // away buffer that was already building, every single time, even when the
+        // position barely needed correcting.
+        const current = player.getCurrentTime();
+        if (typeof time === 'number' && Math.abs(current - time) > SYNC_DRIFT_THRESHOLD) {
+            player.seekTo(time, true);
+        }
         if (action === 'play') player.playVideo();
         else if (action === 'pause') player.pauseVideo();
         // 'seek' (from the ±10s buttons) just moves the playhead and leaves play state as-is.
     }
 
+    /* ================= "Play Together" — countdown-synced start =================
+       Fixes the startup-latency complaint: instead of one side hitting play and the
+       other scrambling to catch up (and buffer) in real time, both sides agree on a
+       shared future timestamp, spend the few seconds before it quietly pre-buffering,
+       and then each independently calls playVideo() when their own clock hits that
+       moment — no extra network round-trip right when timing matters most. */
+    const PLAY_TOGETHER_COUNTDOWN_MS = 3000;
+    let playTogetherTimer = null;
+
+    function playTogether() {
+        if (!player || typeof player.playVideo !== 'function' || !currentVideoId) {
+            addSystemNote('Load a video first, then hit Play Together.');
+            return;
+        }
+        const startTime = (typeof player.getCurrentTime === 'function') ? player.getCurrentTime() : 0;
+        const target = Date.now() + PLAY_TOGETHER_COUNTDOWN_MS;
+        if (conn && conn.open) {
+            safeSend({ type: 'play_together', target: target, startTime: startTime, videoId: currentVideoId });
+        }
+        beginPlayTogetherCountdown(target, startTime);
+    }
+
+    function beginPlayTogetherCountdown(target, startTime) {
+        if (playTogetherTimer) { clearInterval(playTogetherTimer); playTogetherTimer = null; }
+        const overlay = document.getElementById('play-together-overlay');
+        const numberEl = document.getElementById('play-together-number');
+        if (overlay) overlay.classList.add('active');
+
+        // Kick off buffering right now, during the countdown, rather than at the
+        // moment playback needs to start — this is what actually kills the lag.
+        if (player && typeof player.seekTo === 'function') {
+            player.seekTo(startTime, true);
+        }
+
+        const tick = () => {
+            const msLeft = target - Date.now();
+            const secLeft = Math.max(0, Math.ceil(msLeft / 1000));
+            if (numberEl) numberEl.innerText = secLeft > 0 ? String(secLeft) : '▶';
+            if (msLeft <= 0) {
+                clearInterval(playTogetherTimer);
+                playTogetherTimer = null;
+                if (overlay) overlay.classList.remove('active');
+                player.playVideo();
+                // Left un-suppressed on purpose: the normal PLAYING → sync 'play'
+                // message that follows acts as a small safety-net drift correction
+                // in case the two devices' clocks weren't perfectly aligned.
+            }
+        };
+        tick();
+        playTogetherTimer = setInterval(tick, 200);
+    }
+
+    // Small, unobtrusive text hint — reuses the same visual language as the
+    // stuck-buffer hint rather than introducing a new toast system.
+    function addSystemNote(text) {
+        const frame = document.getElementById('screen-frame');
+        if (!frame) return;
+        let note = document.getElementById('system-note');
+        if (!note) {
+            note = document.createElement('div');
+            note.id = 'system-note';
+            note.className = 'stuck-buffer-hint';
+            note.style.display = 'flex';
+            frame.appendChild(note);
+        }
+        note.innerText = text;
+        note.style.display = 'flex';
+        clearTimeout(addSystemNote._t);
+        addSystemNote._t = setTimeout(() => { note.style.display = 'none'; }, 2600);
+    }
+
     function skipBy(seconds) {
         if (!player || typeof player.getCurrentTime !== 'function') return;
         const newTime = Math.max(0, player.getCurrentTime() + seconds);
-        suppressUntil = Date.now() + 1200;
+        syncGeneration++;
+        ignoreStateChangeGen = syncGeneration;
         player.seekTo(newTime, true);
         safeSend({ type: 'sync', action: 'seek', time: newTime });
     }
 
-    function updateNowShowing(title) {
+    function updateNowShowing(title, videoId) {
         const el = document.getElementById('now-showing');
-        if (!el) return;
-        el.innerText = title ? ('Now showing — ' + title) : '';
+        if (el) el.innerText = title ? ('Now showing — ' + title) : '';
+        if (videoId) loadRelatedVideos(videoId, title);
+    }
+
+    /* ================= Related videos strip (our own, not YouTube's in-player one) =================
+       YouTube's built-in "more videos" overlay lives inside the embedded iframe's own
+       cross-origin document — there is no API or DOM access to intercept a click on it,
+       so it always opens a new tab to youtube.com. This strip is the real fix: it uses
+       the same Data API search we already use for the search modal, shows results in our
+       own UI, and reuses the existing "Play now / Add to queue" popup — so a click always
+       stays inside this app and stays in sync with your friend. */
+    let relatedFetchToken = 0;
+
+    async function loadRelatedVideos(videoId, title) {
+        const track = document.getElementById('related-track');
+        if (!track || !videoId) return;
+        const myToken = ++relatedFetchToken; // guards a slow older fetch from clobbering a newer video's results
+        track.innerHTML = '<div class="reel-empty">Finding more like this…</div>';
+        document.getElementById('related-count').innerText = '';
+        try {
+            // The old dedicated "related videos" endpoint (relatedToVideoId) was removed
+            // by YouTube in 2023, so the practical replacement is searching by the
+            // current video's own title — trimmed of trailing "| Official Video" style
+            // noise — which gets genuinely similar results back.
+            const cleanTitle = (title || '').replace(/\s*[|\-–—].*$/, '').trim();
+            const q = cleanTitle || title || videoId;
+            const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=12&q=${encodeURIComponent(q)}&key=${encodeURIComponent(searchApiKey)}`;
+            const res = await fetch(url);
+            if (myToken !== relatedFetchToken) return; // superseded by a newer video load
+            if (!res.ok) {
+                track.innerHTML = '<div class="reel-empty">Couldn\'t load related videos right now.</div>';
+                return;
+            }
+            const data = await res.json();
+            const items = (Array.isArray(data.items) ? data.items : [])
+                .filter(it => it.id && it.id.videoId && it.id.videoId !== videoId)
+                .slice(0, 10);
+            if (myToken !== relatedFetchToken) return;
+            if (items.length === 0) {
+                track.innerHTML = '<div class="reel-empty">No related videos found.</div>';
+                return;
+            }
+            renderRelatedVideos(items);
+        } catch (e) {
+            console.warn('Related videos fetch failed:', e);
+            if (myToken === relatedFetchToken) track.innerHTML = '<div class="reel-empty">Couldn\'t load related videos right now.</div>';
+        }
+    }
+
+    function renderRelatedVideos(items) {
+        const track = document.getElementById('related-track');
+        track.innerHTML = '';
+        items.forEach(it => {
+            const id = it.id.videoId;
+            const t = (it.snippet && it.snippet.title) || id;
+            const channel = (it.snippet && it.snippet.channelTitle) || '';
+            const thumb = (it.snippet && it.snippet.thumbnails &&
+                (it.snippet.thumbnails.medium || it.snippet.thumbnails.default || {}).url)
+                || `https://img.youtube.com/vi/${id}/mqdefault.jpg`;
+            const chip = document.createElement('div');
+            chip.className = 'reel-chip';
+            chip.innerHTML = `
+                <div class="thumb-wrap"><img src="${thumb}" alt="" loading="lazy"></div>
+                <div class="thumb-title">${escapeHtml(t)}</div>`;
+            chip.onclick = () => openPickPopup({ id, title: t, channel, thumb });
+            track.appendChild(chip);
+        });
+        document.getElementById('related-count').innerText = items.length + ' picks';
     }
 
     function playNextInQueue() {
@@ -1310,7 +1626,7 @@
         // just ended — continuing straight into the next queued clip is the
         // whole point of a queue, so this is the one place that keeps autoplay.
         player.loadVideoById(next.id);
-        updateNowShowing(next.title || next.id);
+        updateNowShowing(next.title || next.id, next.id);
         safeSend({ type: 'video', id: next.id });
         safeSend({ type: 'queue_remove', uid: next.uid });
         renderQueue();
@@ -1529,9 +1845,16 @@
             safeSend({ type: 'nickname', name: nickname });
             safeSend({ type: 'queue_sync', queue: queue });
             if (currentVideoId) safeSend({ type: 'video', id: currentVideoId });
+            // A short stagger before the sync message: on a fresh join, cueVideoById
+            // needs a moment to actually initialize before it's ready to accept a
+            // seek — sending sync in the same instant risked the seek landing before
+            // the cue had settled, especially over a slower mobile connection.
             if (playerReady && player && typeof player.getCurrentTime === 'function') {
                 const isPlaying = typeof player.getPlayerState === 'function' && player.getPlayerState() === YT.PlayerState.PLAYING;
-                safeSend({ type: 'sync', action: isPlaying ? 'play' : 'pause', time: player.getCurrentTime() });
+                const t = player.getCurrentTime();
+                setTimeout(() => {
+                    safeSend({ type: 'sync', action: isPlaying ? 'play' : 'pause', time: t });
+                }, currentVideoId ? 600 : 0);
             }
         });
         conn.on('close', handleConnClose);
@@ -1549,13 +1872,23 @@
                         // because the other side picked a video. It'll start in sync once
                         // either person actually presses play (see the 'sync' case below).
                         player.cueVideoById(data.id);
-                        fetchVideoMeta(data.id).then(meta => updateNowShowing(meta.title));
+                        fetchVideoMeta(data.id).then(meta => updateNowShowing(meta.title, data.id));
                         break;
                     case 'reaction':
                         spawnEmoji(data.emoji, friendNickname);
                         break;
                     case 'sync':
                         applyRemoteSync(data.action, data.time);
+                        break;
+                    case 'play_together':
+                        // If the other side just cued a video we haven't caught up to
+                        // yet, cue it now — there's still the countdown window to settle.
+                        if (data.videoId && data.videoId !== currentVideoId) {
+                            currentVideoId = data.videoId;
+                            player.cueVideoById(data.videoId);
+                            fetchVideoMeta(data.videoId).then(meta => updateNowShowing(meta.title, data.videoId));
+                        }
+                        beginPlayTogetherCountdown(data.target, data.startTime || 0);
                         break;
                     case 'theme':
                         applyTheme(data.theme, { fromRemote: true });
@@ -1673,7 +2006,7 @@
         player.cueVideoById(id);
         document.getElementById('url-input').value = '';
         safeSend({ type: 'video', id: id });
-        fetchVideoMeta(id).then(meta => updateNowShowing(meta.title));
+        fetchVideoMeta(id).then(meta => updateNowShowing(meta.title, id));
     }
 
     /* ================= Queue: real thumbnails + titles via YouTube oEmbed ================= */
@@ -1845,7 +2178,7 @@
         // Cue instead of auto-playing — press play on the player when you're ready.
         player.cueVideoById(id);
         safeSend({ type: 'video', id: id });
-        updateNowShowing(title);
+        updateNowShowing(title, id);
         closePickPopup();
         closeSearchModal();
     }
@@ -1904,7 +2237,7 @@
                 currentVideoId = item.id;
                 // Cue instead of auto-playing — press play on the player when you're ready.
                 player.cueVideoById(item.id);
-                updateNowShowing(item.title || item.id);
+                updateNowShowing(item.title || item.id, item.id);
                 safeSend({ type: 'video', id: item.id });
             };
             chip.querySelector('.drag-handle').addEventListener('pointerdown', (ev) => startChipDrag(ev, chip, i));
@@ -2181,8 +2514,19 @@
 
     /* ================= Cozy ambient embers ================= */
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const isSmallScreen = window.matchMedia('(max-width: 640px)').matches;
+    // Phones get fewer, slower embers — this was running unbounded before (a new
+    // ember every 1.4s, each alive 14-26s = 10-18+ animated nodes at all times,
+    // forever, on every device including weak ones, competing with the video
+    // decoder for the same GPU/CPU the whole time it runs). Cap concurrency and
+    // slow the spawn rate on small screens instead.
+    const EMBER_CAP = isSmallScreen ? 5 : 14;
+    const EMBER_INTERVAL_MS = isSmallScreen ? 2600 : 1400;
+    let emberCount = 0;
     function spawnEmber() {
-        if (reduceMotion) return;
+        if (reduceMotion || document.hidden) return;
+        if (isSmallScreen && document.body.classList.contains('video-playing')) return;
+        if (emberCount >= EMBER_CAP) return;
         const field = document.getElementById('ember-field');
         const el = document.createElement('div');
         const size = 3 + Math.random() * 5;
@@ -2194,12 +2538,21 @@
         const duration = 14 + Math.random() * 12;
         el.style.animationDuration = duration + 's';
         field.appendChild(el);
-        setTimeout(() => el.remove(), duration * 1000 + 200);
+        emberCount++;
+        setTimeout(() => { el.remove(); emberCount--; }, duration * 1000 + 200);
     }
     if (!reduceMotion) {
-        for (let i = 0; i < 10; i++) setTimeout(spawnEmber, i * 900);
-        setInterval(spawnEmber, 1400);
+        const initialCount = isSmallScreen ? 4 : 10;
+        for (let i = 0; i < initialCount; i++) setTimeout(spawnEmber, i * 900);
+        setInterval(spawnEmber, EMBER_INTERVAL_MS);
     }
+
+    // Pause all ambient animation work outright when the tab isn't visible — no
+    // point burning battery/CPU animating blurred blobs nobody can see, and it
+    // frees up the main thread (and the video decoder) when it matters most.
+    document.addEventListener('visibilitychange', () => {
+        document.body.classList.toggle('page-hidden', document.hidden);
+    });
 
     /* =========================
        Call feature implementation
