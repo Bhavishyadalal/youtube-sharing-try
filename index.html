@@ -146,6 +146,15 @@
         @media (prefers-reduced-motion: reduce) {
             .ambient-blob, .ember { animation: none; }
         }
+        /* Blur-heavy full-screen animation is the costliest thing on this page for
+           weaker GPUs. On phones: drop one blob entirely, shrink the blur radius on
+           the rest, and let JS pause everything outright when the tab isn't visible. */
+        @media (max-width: 640px) {
+            .ambient-blob { filter: blur(46px); }
+            .ambient-blob.b3 { display: none; }
+        }
+        .page-hidden .ambient-blob,
+        .page-hidden .ember { animation-play-state: paused; }
 
         /* ---------- Marquee header ---------- */
         .marquee-bar {
@@ -578,6 +587,13 @@
             font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--live); margin-bottom: 14px;
         }
         .connected-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--live); box-shadow: 0 0 8px 2px var(--live-glow); animation: pulse-live 1.8s ease-in-out infinite; }
+        .link-path-badge {
+            display: inline-flex; align-items: center; gap: 6px; margin: 0 0 14px 8px;
+            padding: 5px 12px; border-radius: 999px; font-size: 11px; letter-spacing: 0.04em;
+        }
+        .link-path-badge.direct { background: rgba(61,220,151,0.12); border: 1px solid rgba(61,220,151,0.35); color: var(--live); }
+        .link-path-badge.relay { background: rgba(255,196,66,0.12); border: 1px solid rgba(255,196,66,0.4); color: #ffcf5c; }
+        .link-path-badge.checking { background: var(--surface); border: 1px solid var(--border); color: var(--text-faint); }
         .connected-card .field-label { text-align: center; }
         .connected-room-id {
             font-size: 26px; letter-spacing: 0.14em; font-weight: 500; margin: 2px 0 16px;
@@ -769,6 +785,10 @@
             .reaction-dock { bottom: 16px; padding: 8px 10px; gap: 8px; }
         }
         @media (max-width: 600px) {
+            /* Sticky + backdrop-filter forces a blur recompute on every scroll
+               frame — the single worst mobile perf trap in this file. A solid
+               near-opaque color looks nearly identical and costs nothing. */
+            .marquee-bar { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(9, 10, 15, 0.96); }
             .wordmark h1 { font-size: 24px; }
             .tagline, .now-showing { display: none; }
             .bar-right { gap: 6px; }
@@ -1063,6 +1083,7 @@
 
         <div class="connected-card" id="connected-card">
             <div class="connected-badge" id="connected-badge"><span class="dot"></span>Connected</div>
+            <div class="link-path-badge" id="link-path-badge" style="display:none;"></div>
             <label class="field-label">You're watching together in room</label>
             <div class="connected-room-id mono" id="connected-room-id">•••••</div>
             <div class="connected-actions">
@@ -1405,7 +1426,55 @@
         } else {
             stopSessionTimer();
             document.getElementById('typing-indicator').classList.remove('active');
+            const badge = document.getElementById('link-path-badge');
+            if (badge) badge.style.display = 'none';
         }
+    }
+
+    // Confirms whether this session actually got a direct P2P path or fell
+    // back through the TURN relay, instead of guessing. A relayed connection
+    // isn't broken — it's just genuinely one extra hop (you -> relay -> friend)
+    // and a free shared relay isn't guaranteed fast, so it's worth knowing
+    // which one you're on when something feels laggy.
+    function checkLinkPath() {
+        const badge = document.getElementById('link-path-badge');
+        if (!badge) return;
+        badge.style.display = 'inline-flex';
+        badge.className = 'link-path-badge checking';
+        badge.innerText = '🔎 Checking connection…';
+        const pc = conn && (conn.peerConnection || conn._pc);
+        if (!pc || typeof pc.getStats !== 'function') {
+            badge.style.display = 'none';
+            return;
+        }
+        // The selected candidate pair can take a moment to settle right after
+        // 'open' fires, so give it a beat before reading stats.
+        setTimeout(async () => {
+            try {
+                const stats = await pc.getStats();
+                let pairStats = null;
+                stats.forEach(r => {
+                    if (r.type === 'candidate-pair' && (r.selected || r.nominated) && r.state === 'succeeded') pairStats = r;
+                });
+                if (!pairStats) {
+                    stats.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pairStats = stats.get(r.selectedCandidatePairId); });
+                }
+                if (!pairStats) { badge.style.display = 'none'; return; }
+                const local = stats.get(pairStats.localCandidateId);
+                const remote = stats.get(pairStats.remoteCandidateId);
+                const isRelay = (local && local.candidateType === 'relay') || (remote && remote.candidateType === 'relay');
+                if (isRelay) {
+                    badge.className = 'link-path-badge relay';
+                    badge.innerText = '🔁 Relayed connection';
+                } else {
+                    badge.className = 'link-path-badge direct';
+                    badge.innerText = '🔗 Direct connection';
+                }
+            } catch (e) {
+                console.warn('Could not read connection stats:', e);
+                badge.style.display = 'none';
+            }
+        }, 1500);
     }
 
     /* ================= Landing screen: create/join happens here, before the app opens ================= */
@@ -1550,6 +1619,7 @@
             clearJoinError();
             reconnectAttempts = 0;
             setStatus(true);
+            checkLinkPath();
             const joinBtn = document.getElementById('join-btn');
             if (joinBtn) { joinBtn.disabled = false; joinBtn.innerText = 'Join room'; }
             // Bring a freshly-joined (or just-reconnected) friend fully up to speed:
@@ -2211,8 +2281,19 @@
 
     /* ================= Cozy ambient embers ================= */
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const isSmallScreen = window.matchMedia('(max-width: 640px)').matches;
+    // Phones get fewer, slower embers — this was running unbounded before (an
+    // ember every 1.4s, alive 14-26s each = 10-18 animated nodes at all times,
+    // forever, on every device including weak ones). Cap concurrency and slow
+    // the spawn rate on small screens instead.
+    const EMBER_CAP = isSmallScreen ? 5 : 14;
+    const EMBER_INTERVAL_MS = isSmallScreen ? 2600 : 1400;
+    let emberCount = 0;
+    let emberIntervalHandle = null;
+
     function spawnEmber() {
-        if (reduceMotion) return;
+        if (reduceMotion || document.hidden) return;
+        if (emberCount >= EMBER_CAP) return;
         const field = document.getElementById('ember-field');
         const el = document.createElement('div');
         const size = 3 + Math.random() * 5;
@@ -2224,12 +2305,22 @@
         const duration = 14 + Math.random() * 12;
         el.style.animationDuration = duration + 's';
         field.appendChild(el);
-        setTimeout(() => el.remove(), duration * 1000 + 200);
+        emberCount++;
+        setTimeout(() => { el.remove(); emberCount--; }, duration * 1000 + 200);
     }
     if (!reduceMotion) {
-        for (let i = 0; i < 10; i++) setTimeout(spawnEmber, i * 900);
-        setInterval(spawnEmber, 1400);
+        const initialCount = isSmallScreen ? 4 : 10;
+        for (let i = 0; i < initialCount; i++) setTimeout(spawnEmber, i * 900);
+        emberIntervalHandle = setInterval(spawnEmber, EMBER_INTERVAL_MS);
     }
+
+    // Pause all ambient animation work outright when the tab isn't visible —
+    // no point burning battery/CPU animating blurred blobs nobody can see, and
+    // it frees up the main thread for message/player handling when the tab
+    // comes back into focus and everything needs to catch up at once.
+    document.addEventListener('visibilitychange', () => {
+        document.body.classList.toggle('page-hidden', document.hidden);
+    });
 
     /* =========================
        Call feature implementation
