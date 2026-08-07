@@ -640,6 +640,17 @@
         }
         .room-summary-idle .btn { padding: 8px 12px; font-size: 12px; flex-shrink: 0; }
 
+        .conn-error-note {
+            margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+            background: rgba(255,92,92,0.08); border: 1px solid rgba(255,92,92,0.3);
+            color: #ff9d9d; font-size: 12px; line-height: 1.5; text-align: left;
+        }
+        .conn-error-note button {
+            display: inline; background: none; border: none; padding: 0; margin-left: 4px;
+            color: var(--marquee); font-size: 12px; font-weight: 600; text-decoration: underline;
+            cursor: pointer;
+        }
+
         .chat-area {
             flex: 1; min-height: 200px; max-height: 30vh; overflow-y: auto;
             display: flex; flex-direction: column; gap: 8px; padding-right: 4px;
@@ -829,6 +840,7 @@
                     <div class="waiting-dot" id="waiting-dot"></div>
                     <span id="waiting-label">Send this to your friend, then wait here</span>
                 </div>
+                <div class="conn-error-note" id="broker-error-note" style="display:none;"></div>
             </div>
         </div>
 
@@ -836,6 +848,7 @@
             <label class="field-label" for="peer-id-input">Your friend's 5-digit code</label>
             <input type="text" id="peer-id-input" inputmode="numeric" maxlength="5" placeholder="00000">
             <button class="btn btn-primary" id="join-btn" onclick="connectToPeer()" style="width: 100%; margin-top: 12px;">Join room</button>
+            <div class="conn-error-note" id="join-error-note" style="display:none;"></div>
         </div>
 
         <button class="landing-skip" onclick="enterApp()">Continue without a friend for now →</button>
@@ -1108,6 +1121,23 @@
         return String(Math.floor(10000 + Math.random() * 90000));
     }
 
+    // The PeerJS default config only ships a single Google STUN server, which
+    // is enough on open home networks but silently fails (no error, no
+    // timeout — just hangs) as soon as either side is behind a stricter NAT
+    // (common on mobile data, campus/office wifi, some routers). Adding a
+    // couple more STUN options plus a free TURN relay as a last resort
+    // meaningfully increases how often two random people can actually reach
+    // each other, at zero cost.
+    const ICE_CONFIG = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun.cloudflare.com:3478' },
+            { urls: 'turn:free.expressturn.com:3478', username: '000000002101431517', credential: 'st6pOqjUb+CM0yv4KlKHWGoLu7s=' },
+            { urls: 'turn:free.expressturn.com:3478?transport=tcp', username: '000000002101431517', credential: 'st6pOqjUb+CM0yv4KlKHWGoLu7s=' }
+        ]
+    };
+
     // Keeps the full room-code display (landing screen) and the compact
     // mini one (sidebar, once inside the app) in sync with a single call.
     function setMyIdDisplay(text) {
@@ -1125,9 +1155,20 @@
         }
         attempt = attempt || 0;
         const code = generateCode();
-        peer = new Peer(code);
+        peer = new Peer(code, { config: ICE_CONFIG });
+
+        // If we can't even reach the signalling broker (PeerJS Cloud has real,
+        // documented outages) don't leave the room code spinning forever —
+        // surface it and offer a one-click retry.
+        clearTimeout(initPeer._brokerTimeout);
+        initPeer._brokerTimeout = setTimeout(() => {
+            if (peer && peer.open) return;
+            showBrokerError();
+        }, 10000);
 
         peer.on('open', id => {
+            clearTimeout(initPeer._brokerTimeout);
+            hideBrokerError();
             setMyIdDisplay(id);
             // A friend opened our shared invite link — jump straight to joining their room.
             if (roomFromUrl && roomFromUrl !== id && !autoJoinAttempted) {
@@ -1163,10 +1204,30 @@
             if (err.type === 'unavailable-id' && attempt < 6) {
                 peer.destroy();
                 initPeer(attempt + 1);
+            } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') {
+                showBrokerError();
             } else {
                 console.error('Peer error:', err);
             }
         });
+    }
+
+    function showBrokerError() {
+        const note = document.getElementById('broker-error-note');
+        if (!note) return;
+        note.style.display = 'block';
+        note.innerHTML = "Couldn't reach the connection server. This is usually temporary — " +
+            '<button onclick="retryPeerInit()">tap to retry</button>';
+    }
+    function hideBrokerError() {
+        const note = document.getElementById('broker-error-note');
+        if (note) note.style.display = 'none';
+    }
+    function retryPeerInit() {
+        hideBrokerError();
+        setMyIdDisplay('•••••');
+        try { if (peer) peer.destroy(); } catch (e) { /* already gone */ }
+        initPeer(0);
     }
     try { initPeer(); } catch (e) { console.error('initPeer threw:', e); }
 
@@ -1363,26 +1424,70 @@
         });
     }
 
+    let joinTimeoutHandle = null;
+
     function connectToPeer() {
         const code = document.getElementById('peer-id-input').value.trim();
         if (!code) return;
+        if (!peer || !peer.open) {
+            showJoinError("Not connected to the server yet — wait a second and try again.");
+            return;
+        }
         manualDisconnect = false;
         lastJoinedCode = code;
+        clearJoinError();
         const btn = document.getElementById('join-btn');
         btn.disabled = true;
         btn.innerText = 'Connecting…';
-        conn = peer.connect(code, { serialization: 'json' });
-        conn.on('error', () => {
+        conn = peer.connect(code, { serialization: 'json', reliable: true });
+        conn.on('error', (err) => {
+            clearJoinTimeout();
             btn.disabled = false;
             btn.innerText = 'Join room';
+            showJoinError('Could not reach that room code. Double-check it and try again.');
+            console.error('Connect error:', err);
         });
         setupConn();
+        startJoinTimeout();
+    }
+
+    // A dropped ICE negotiation (e.g. both sides behind strict/symmetric NAT
+    // with no working TURN candidate) never fires 'open' *or* 'error' on the
+    // DataConnection — it just hangs. Without this, the button would say
+    // "Connecting…" forever with zero feedback. This turns that into a clear,
+    // actionable message instead.
+    function startJoinTimeout() {
+        clearJoinTimeout();
+        joinTimeoutHandle = setTimeout(() => {
+            if (conn && conn.open) return;
+            try { if (conn) conn.close(); } catch (e) { /* already gone */ }
+            const btn = document.getElementById('join-btn');
+            if (btn) { btn.disabled = false; btn.innerText = 'Join room'; }
+            showJoinError("Couldn't connect — double-check the code is right and both of you are online. " +
+                'If it keeps happening, one of you may be on a network (office/campus wifi, some mobile carriers) that blocks direct connections.');
+        }, 15000);
+    }
+    function clearJoinTimeout() {
+        if (joinTimeoutHandle) clearTimeout(joinTimeoutHandle);
+        joinTimeoutHandle = null;
+    }
+    function showJoinError(text) {
+        const note = document.getElementById('join-error-note');
+        if (!note) return;
+        note.style.display = 'block';
+        note.innerText = text;
+    }
+    function clearJoinError() {
+        const note = document.getElementById('join-error-note');
+        if (note) note.style.display = 'none';
     }
 
     function disconnectRoom() {
         manualDisconnect = true;
         lastJoinedCode = null;
         reconnectAttempts = 0;
+        clearJoinTimeout();
+        clearJoinError();
         if (conn) { conn.close(); conn = null; }
         setStatus(false);
         const joinBtn = document.getElementById('join-btn');
@@ -1401,14 +1506,17 @@
         setTimeout(() => {
             if (manualDisconnect || !lastJoinedCode) return;
             try {
-                conn = peer.connect(lastJoinedCode, { serialization: 'json' });
+                conn = peer.connect(lastJoinedCode, { serialization: 'json', reliable: true });
                 setupConn();
+                startJoinTimeout();
             } catch (e) { console.error('Reconnect attempt failed:', e); }
         }, delay);
     }
 
     function setupConn() {
         conn.on('open', () => {
+            clearJoinTimeout();
+            clearJoinError();
             reconnectAttempts = 0;
             setStatus(true);
             const joinBtn = document.getElementById('join-btn');
@@ -1480,6 +1588,13 @@
                     case 'queue_sync':
                         queue = Array.isArray(data.queue) ? data.queue : queue;
                         renderQueue();
+                        break;
+                    // The non-initiating side asks the initiator to place the actual
+                    // WebRTC call — see isCallInitiator() for why only one side may call().
+                    case 'call_request':
+                        if (isCallInitiator() && !mediaCall) {
+                            startCall().catch(e => console.warn('startCall (via request) failed:', e));
+                        }
                         break;
                 }
             } catch (e) {
@@ -2095,9 +2210,14 @@
     async function getLocalStream(opts) {
         opts = opts || { audio: { echoCancellation: true, noiseSuppression: true } };
         if (localStream) {
-            // If the stored stream has ended, recreate
-            const tracksAlive = localStream.getAudioTracks().some(t => t && t.enabled !== undefined);
+            // If the stored stream's track has actually ended (device lost, previous
+            // call torn down, etc.) `enabled` is still a boolean either way, so that
+            // alone can't tell live from dead — check readyState instead, or a re-call
+            // silently reuses a dead track and sends nothing.
+            const tracks = localStream.getAudioTracks();
+            const tracksAlive = tracks.length > 0 && tracks.every(t => t.readyState === 'live');
             if (tracksAlive) return localStream;
+            localStream = null;
         }
         try {
             localStream = await navigator.mediaDevices.getUserMedia(opts);
@@ -2420,6 +2540,18 @@
         }
     }
 
+    // Exactly ONE side may ever place the outgoing peer.call(). If both peers
+    // press "Call only" around the same time and both call peer.call() on each
+    // other, you get two independent WebRTC offers colliding ("glare") — the
+    // classic symptom being one person's mic audio never actually connects
+    // while the other's does. A stable, deterministic tie-break (compare the
+    // two 5-digit room codes) means only one side ever originates the call;
+    // the other side always answers via peer.on('call').
+    function isCallInitiator() {
+        if (!peer || !peer.id || !conn || !conn.peer) return false;
+        return String(peer.id) < String(conn.peer);
+    }
+
     // UI toggle: show the call section and hide the watch view; do not destroy state
     function toggleCallView() {
         const callSection = document.getElementById('call-section');
@@ -2433,7 +2565,16 @@
                     alert('You must be connected with your friend to start a voice call.');
                     return;
                 }
-                startCall().catch(e => console.warn('startCall error', e));
+                if (isCallInitiator()) {
+                    startCall().catch(e => console.warn('startCall error', e));
+                } else {
+                    // We're the non-initiating side: don't place our own peer.call()
+                    // (that's what caused one-way audio). Ask the initiator to call us;
+                    // their incoming call will arrive via peer.on('call') momentarily.
+                    safeSend({ type: 'call_request' });
+                    const statusEl = document.getElementById('remote-status');
+                    if (statusEl) statusEl.innerText = 'Connecting…';
+                }
             }
             // pause the video and sync the pause to the peer
             if (player && typeof player.pauseVideo === 'function') {
