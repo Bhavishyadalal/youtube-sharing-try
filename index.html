@@ -855,6 +855,69 @@
             100% { opacity: 0; transform: translateY(-220px) scale(1.05); }
         }
 
+        /* ---------- Fullscreen theater mode + in-fullscreen reactions ----------
+           YouTube's own in-player fullscreen button fullscreens the iframe itself,
+           and a cross-origin iframe's native fullscreen paints in the browser's
+           top layer — nothing from our page can render on top of it. So instead
+           of relying on that button, we give our own "screen-frame" wrapper (the
+           iframe's parent) a matching fullscreen/edge-to-edge mode: real
+           Fullscreen API where it's supported, with a pure-CSS fallback
+           everywhere else (including iOS Safari, which doesn't support
+           requestFullscreen() on arbitrary elements). Either way our own reaction
+           button/tray live inside this same wrapper, so they always render. */
+        .theater-toggle-btn {
+            position: absolute; top: 10px; right: 10px; z-index: 8;
+            width: 38px; height: 38px; border-radius: 9px; border: 1px solid var(--border);
+            background: rgba(4,4,8,0.55); backdrop-filter: blur(6px); color: var(--text);
+            display: flex; align-items: center; justify-content: center; font-size: 16px;
+            cursor: pointer; transition: 0.2s;
+        }
+        .theater-toggle-btn:hover { border-color: var(--marquee); background: rgba(4,4,8,0.82); }
+        .theater-toggle-btn:active { transform: scale(0.92); }
+
+        .screen-frame.theater-fullscreen {
+            position: fixed; inset: 0; z-index: 140; width: 100vw; height: 100vh;
+            border-radius: 0; border: none; display: flex; align-items: center; justify-content: center;
+        }
+        .screen-frame.theater-fullscreen #yt-player { height: 100vh; width: 100vw; }
+        .screen-frame.theater-fullscreen .sprocket-strip { display: none; }
+        body.theater-lock { overflow: hidden; }
+
+        .fs-reaction-btn {
+            display: none; position: absolute; z-index: 9; right: 16px; bottom: 84px;
+            width: 52px; height: 52px; border-radius: 50%;
+            background: linear-gradient(135deg, var(--marquee), var(--marquee2)); color: var(--marquee-ink);
+            border: none; font-size: 22px; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+            align-items: center; justify-content: center;
+        }
+        /* Only meaningful (and only shown) once we're actually in our own
+           fullscreen wrapper — in the normal layout the existing reaction-dock
+           already covers this, so we don't need a second one cluttering the page. */
+        .screen-frame.theater-fullscreen .fs-reaction-btn { display: flex; }
+        .fs-reaction-btn:hover { box-shadow: 0 0 20px var(--marquee-soft); }
+        .fs-reaction-btn:active { transform: scale(0.92); }
+
+        .fs-reaction-tray {
+            display: none; position: absolute; right: 16px; bottom: 148px; z-index: 9;
+            width: 250px; max-height: 260px; overflow-y: auto; padding: 12px;
+            grid-template-columns: repeat(6, 1fr); gap: 6px;
+            border-radius: 16px; background: rgba(8,8,14,0.94); backdrop-filter: blur(14px);
+            border: 1px solid var(--border); box-shadow: 0 20px 45px rgba(0,0,0,0.55);
+        }
+        .fs-reaction-tray.open { display: grid; }
+        .fs-reaction-tray button {
+            background: transparent; border: none; font-size: 20px; cursor: pointer;
+            border-radius: 8px; padding: 6px 0; transition: 0.15s; line-height: 1;
+        }
+        .fs-reaction-tray button:hover { background: rgba(255,255,255,0.08); transform: scale(1.15); }
+        .fs-reaction-tray::-webkit-scrollbar { width: 6px; }
+
+        @media (max-width: 600px) {
+            .fs-reaction-btn { right: 12px; bottom: 74px; width: 48px; height: 48px; font-size: 20px; }
+            .fs-reaction-tray { right: 10px; bottom: 128px; width: 208px; max-height: 220px; grid-template-columns: repeat(5, 1fr); }
+            .theater-toggle-btn { top: 8px; right: 8px; width: 40px; height: 40px; }
+        }
+
         /* ---------- Responsive ---------- */
         @media (max-width: 980px) {
             .layout { grid-template-columns: 1fr; padding: 16px; gap: 18px; }
@@ -1034,6 +1097,9 @@
                     <div class="play-together-number" id="play-together-number">3</div>
                     <div class="play-together-label">Starting together…</div>
                 </div>
+                <button class="theater-toggle-btn" id="theater-toggle-btn" onclick="toggleTheaterMode()" title="Fullscreen" aria-label="Toggle fullscreen">⛶</button>
+                <button class="fs-reaction-btn" id="fs-reaction-btn" onclick="toggleFsReactionTray(event)" title="Send a reaction" aria-label="Open reactions">😊</button>
+                <div class="fs-reaction-tray" id="fs-reaction-tray"></div>
             </div>
 
             <div class="glass controls" id="controls">
@@ -2276,6 +2342,7 @@
         if (e.key !== 'Escape') return;
         if (document.getElementById('pick-overlay').classList.contains('open')) closePickPopup();
         else if (document.getElementById('search-overlay').classList.contains('open')) closeSearchModal();
+        else if (document.getElementById('screen-frame').classList.contains('theater-fullscreen')) exitTheaterMode();
     });
 
     function removeFromQueue(index, e) {
@@ -2395,7 +2462,12 @@
             tag.innerText = from;
             wrap.appendChild(tag);
         }
-        document.body.appendChild(wrap);
+        // In theater/fullscreen mode this has to land inside the fullscreen
+        // wrapper itself — anything appended to <body> would be invisible,
+        // painted behind the fullscreened video by the browser.
+        const frame = document.getElementById('screen-frame');
+        const target = (frame && frame.classList.contains('theater-fullscreen')) ? frame : document.body;
+        target.appendChild(wrap);
         setTimeout(() => wrap.remove(), 2200);
     }
 
@@ -3129,6 +3201,117 @@
 
     // Ensure UI updates if nickname changes from remote
     // (also update when we receive 'nickname' messages in setupConn)
+
+    /* =========================================================================
+       ===== Fullscreen theater mode + in-fullscreen reactions (all-new) =======
+       See the CSS block "Fullscreen theater mode" above for why this exists:
+       YouTube's own fullscreen button fullscreens the iframe, and nothing on
+       our page can render on top of a fullscreened cross-origin iframe. So we
+       give #screen-frame its own matching fullscreen mode (real Fullscreen API
+       where supported, CSS-only edge-to-edge fallback everywhere else,
+       including iOS Safari) and put the reaction button/tray inside that same
+       element so they always render, never overlapping YouTube's own control
+       bar at the bottom.
+       ========================================================================= */
+    function getFsElement() {
+        return document.fullscreenElement || document.webkitFullscreenElement ||
+               document.mozFullScreenElement || document.msFullscreenElement || null;
+    }
+    function requestFsOn(el) {
+        const fn = el.requestFullscreen || el.webkitRequestFullscreen ||
+                   el.mozRequestFullScreen || el.msRequestFullscreen;
+        if (!fn) return; // no native support (e.g. iOS Safari) — CSS mode alone still works
+        try {
+            const p = fn.call(el);
+            if (p && typeof p.catch === 'function') p.catch(() => { /* denied/unsupported — CSS mode still covers it */ });
+        } catch (e) { /* ignore — CSS mode still covers it */ }
+    }
+    function exitFsNow() {
+        const fn = document.exitFullscreen || document.webkitExitFullscreen ||
+                   document.mozCancelFullScreen || document.msExitFullscreen;
+        if (!fn) return;
+        try {
+            const p = fn.call(document);
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch (e) { /* ignore */ }
+    }
+
+    function toggleTheaterMode() {
+        const frame = document.getElementById('screen-frame');
+        if (frame.classList.contains('theater-fullscreen')) exitTheaterMode();
+        else enterTheaterMode();
+    }
+    function enterTheaterMode() {
+        const frame = document.getElementById('screen-frame');
+        if (frame.classList.contains('theater-fullscreen')) return;
+        frame.classList.add('theater-fullscreen');
+        document.body.classList.add('theater-lock');
+        const btn = document.getElementById('theater-toggle-btn');
+        if (btn) { btn.innerText = '✕'; btn.title = 'Exit fullscreen'; }
+        requestFsOn(frame);
+    }
+    function exitTheaterMode() {
+        const frame = document.getElementById('screen-frame');
+        if (!frame.classList.contains('theater-fullscreen')) return;
+        frame.classList.remove('theater-fullscreen');
+        document.body.classList.remove('theater-lock');
+        const btn = document.getElementById('theater-toggle-btn');
+        if (btn) { btn.innerText = '⛶'; btn.title = 'Fullscreen'; }
+        closeFsReactionTray();
+        if (getFsElement()) exitFsNow();
+    }
+
+    function onFsChange() {
+        const fsEl = getFsElement();
+        const frame = document.getElementById('screen-frame');
+        if (!frame) return;
+        if (fsEl && fsEl !== frame) {
+            // Something inside our wrapper (the YouTube iframe, via its own
+            // in-player fullscreen button) went fullscreen on its own. Hand off
+            // to our own fullscreen wrapper instead, so the reaction tray works.
+            exitFsNow();
+            enterTheaterMode();
+            return;
+        }
+        if (!fsEl && frame.classList.contains('theater-fullscreen')) {
+            // Real fullscreen ended on its own (Esc key / Android back gesture) —
+            // keep our button/state in sync instead of leaving a stale look.
+            exitTheaterMode();
+        }
+    }
+    ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach(evt => {
+        document.addEventListener(evt, onFsChange);
+    });
+
+    /* ---------- In-fullscreen reaction tray (same emojis, same effect, as the home dock) ---------- */
+    let fsTrayBuilt = false;
+    function toggleFsReactionTray(e) {
+        if (e) e.stopPropagation();
+        const tray = document.getElementById('fs-reaction-tray');
+        if (!tray) return;
+        if (!fsTrayBuilt) {
+            EMOJI_SET.forEach(em => {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.innerText = em;
+                b.onclick = (ev) => { ev.stopPropagation(); sendReaction(em); closeFsReactionTray(); };
+                tray.appendChild(b);
+            });
+            fsTrayBuilt = true;
+        }
+        tray.classList.toggle('open');
+    }
+    function closeFsReactionTray() {
+        const tray = document.getElementById('fs-reaction-tray');
+        if (tray) tray.classList.remove('open');
+    }
+    document.addEventListener('click', (e) => {
+        const tray = document.getElementById('fs-reaction-tray');
+        const btn = document.getElementById('fs-reaction-btn');
+        if (tray && tray.classList.contains('open') && !tray.contains(e.target) && e.target !== btn) {
+            closeFsReactionTray();
+        }
+    });
 
     // End of script
 </script>
