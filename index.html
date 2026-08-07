@@ -691,6 +691,19 @@
             cursor:pointer; font-weight:600; color:var(--text); font-size:13px;
         }
 
+        /* ---------- Room info: collapses into a top-bar popup once connected, so
+           the sidebar doesn't waste space repeating what the top bar already
+           shows, and chat sits higher without needing a scroll. ---------- */
+        .room-info-btn {
+            display: none; align-items: center; gap: 8px;
+            padding: 8px 16px; border-radius: 999px; border: 1px solid rgba(61,220,151,0.35);
+            background: rgba(61,220,151,0.1); color: var(--live);
+            font-family: 'Inter', sans-serif; font-weight: 600; font-size: 12px; cursor: pointer; transition: 0.2s;
+        }
+        .room-info-btn:hover { background: rgba(61,220,151,0.18); box-shadow: 0 0 14px var(--live-glow); }
+        .room-info-panel { width: 270px; padding: 6px; }
+        .room-info-panel .connected-card { padding: 18px 14px; }
+
         /* ---------- Landing screen (create / join, shown before entering the app) ---------- */
         .landing-overlay {
             position: fixed; inset: 0; z-index: 150;
@@ -1069,6 +1082,9 @@
             <div class="status-dot" id="status-dot"></div>
             <span id="status-label">Offline</span>
         </div>
+        <button class="room-info-btn" id="room-info-btn" onclick="toggleRoomInfoPanel(event)" title="Room info">
+            🎬 <span>Room</span>
+        </button>
 
         <!-- Top bar Call only button (shows live state when in a call) -->
         <button class="theme-toggle" onclick="toggleThemePanel(event)">🎨 <span>Theme</span></button>
@@ -1080,6 +1096,19 @@
         <div class="theme-panel" id="theme-panel">
             <div class="theme-panel-title"><span>Pick a vibe</span><span class="synced-note">syncs to your friend</span></div>
             <div class="theme-list" id="theme-list"></div>
+        </div>
+
+        <div class="theme-panel room-info-panel" id="room-info-panel">
+            <div class="theme-panel-title"><span>Watching together</span></div>
+            <div class="connected-card active" id="connected-card">
+                <div class="connected-badge" id="connected-badge"><span class="dot"></span>Connected</div>
+                <label class="field-label">You're watching together in room</label>
+                <div class="connected-room-id mono" id="connected-room-id">•••••</div>
+                <div class="connected-actions">
+                    <button class="btn btn-ghost" onclick="copyRoomCode(event)">Copy room code</button>
+                    <button class="btn btn-danger" onclick="disconnectRoom()">Disconnect</button>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -1223,28 +1252,19 @@
     </div>
 
     <div class="glass side-col">
-        <h3>Watch with a friend</h3>
+        <div id="watch-with-friend-block">
+            <h3>Watch with a friend</h3>
 
-        <div class="room-summary-idle" id="room-summary-idle">
-            <div>
-                <div class="rsi-label">Your room code</div>
-                <div class="rsi-code mono" id="mini-room-code">•••••</div>
+            <div class="room-summary-idle" id="room-summary-idle">
+                <div>
+                    <div class="rsi-label">Your room code</div>
+                    <div class="rsi-code mono" id="mini-room-code">•••••</div>
+                </div>
+                <button class="btn btn-ghost" onclick="openLanding()">Invite / Join</button>
             </div>
-            <button class="btn btn-ghost" onclick="openLanding()">Invite / Join</button>
-        </div>
 
-        <div class="connected-card" id="connected-card">
-            <div class="connected-badge" id="connected-badge"><span class="dot"></span>Connected</div>
-            <label class="field-label">You're watching together in room</label>
-            <div class="connected-room-id mono" id="connected-room-id">•••••</div>
-            <div class="connected-actions">
-                <button class="btn btn-ghost" onclick="copyRoomCode(event)">Copy room code</button>
-                <button class="btn btn-ghost call-button-inline" onclick="toggleCallView()" id="connected-call-btn">📞 Call only</button>
-                <button class="btn btn-danger" onclick="disconnectRoom()">Disconnect</button>
-            </div>
+            <div class="divider"></div>
         </div>
-
-        <div class="divider"></div>
 
         <h3>Chat</h3>
         <div class="chat-area" id="chat">
@@ -1818,6 +1838,18 @@
         document.getElementById('connected-card').classList.toggle('active', isLive);
         const idleWidget = document.getElementById('room-summary-idle');
         if (idleWidget) idleWidget.style.display = isLive ? 'none' : 'flex';
+
+        // Once connected, the "Watch with a friend" block in the sidebar is just
+        // repeating what the top-bar Room button already shows — collapse it so
+        // Chat sits higher and doesn't need a scroll to reach.
+        const friendBlock = document.getElementById('watch-with-friend-block');
+        if (friendBlock) friendBlock.style.display = isLive ? 'none' : '';
+        const roomInfoBtn = document.getElementById('room-info-btn');
+        if (roomInfoBtn) roomInfoBtn.style.display = isLive ? 'flex' : 'none';
+        if (!isLive) {
+            const panel = document.getElementById('room-info-panel');
+            if (panel) panel.classList.remove('open');
+        }
 
         if (isLive) {
             const roomId = (conn && conn.peer) ? conn.peer : document.getElementById('my-id-display').innerText;
@@ -2635,6 +2667,15 @@
         e.stopPropagation();
         document.getElementById('theme-panel').classList.toggle('open');
         document.getElementById('emoji-panel').classList.remove('open');
+        const roomPanel = document.getElementById('room-info-panel');
+        if (roomPanel) roomPanel.classList.remove('open');
+    }
+
+    function toggleRoomInfoPanel(e) {
+        if (e) e.stopPropagation();
+        document.getElementById('room-info-panel').classList.toggle('open');
+        document.getElementById('theme-panel').classList.remove('open');
+        document.getElementById('emoji-panel').classList.remove('open');
     }
 
     /* ================= Full emoji picker ================= */
@@ -2655,11 +2696,15 @@
         e.stopPropagation();
         document.getElementById('emoji-panel').classList.toggle('open');
         document.getElementById('theme-panel').classList.remove('open');
+        const roomPanel = document.getElementById('room-info-panel');
+        if (roomPanel) roomPanel.classList.remove('open');
     }
 
     document.addEventListener('click', () => {
         document.getElementById('theme-panel').classList.remove('open');
         document.getElementById('emoji-panel').classList.remove('open');
+        const roomPanel = document.getElementById('room-info-panel');
+        if (roomPanel) roomPanel.classList.remove('open');
     });
 
     /* ================= Cozy ambient embers ================= */
