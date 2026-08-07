@@ -149,15 +149,18 @@
 
         /* ---------- Marquee header ---------- */
         .marquee-bar {
-            position: relative;
-            z-index: 10;
+            position: sticky;
+            top: 0;
+            z-index: 30;
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 12px;
             padding: 14px 32px;
             border-bottom: 1px solid var(--border);
-            background: linear-gradient(180deg, rgba(255,255,255,0.03), transparent);
+            background: rgba(9, 10, 15, 0.82);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
             flex-wrap: wrap;
         }
 
@@ -772,6 +775,8 @@
             .status-pill span { display: none; }
             .status-pill { padding: 8px 10px; }
             .theme-toggle span { display: none; }
+            #call-top-label, #call-top-mini { display: none; }
+            .call-button-inline { padding: 8px 10px; }
             .controls { flex-wrap: wrap; }
             #url-input { flex-basis: 100%; }
             .room-code-actions { flex-direction: column; }
@@ -779,6 +784,32 @@
             .btn { padding: 13px 20px; }
             .icon-btn, .skip-btn { width: 46px; height: 46px; }
             .reaction-btn, .reaction-more { width: 50px; height: 50px; }
+
+            /* Call cards: side-by-side avatar+text and a locked 2-column grid
+               is what was squeezing everything on phones — stack both. */
+            .call-grid { grid-template-columns: 1fr; gap: 10px; }
+            .call-card { flex-direction: column; text-align: center; gap: 8px; padding: 16px 12px; }
+            .avatar { width: 56px; height: 56px; font-size: 22px; }
+            .call-info { width: 100%; }
+            .call-controls, .call-actions, .call-footer { flex-wrap: wrap; justify-content: center; }
+            .mic-meter { width: 100%; max-width: 160px; }
+
+            /* Room codes at 34px/26px with wide letter-spacing overflow narrow
+               screens — scale both down and tighten the tracking. */
+            .room-code-value { font-size: 26px; letter-spacing: 0.1em; }
+            .connected-room-id { font-size: 20px; letter-spacing: 0.08em; }
+            #peer-id-input { font-size: 16px; letter-spacing: 0.22em; }
+
+            .side-col, .call-section, .landing-card { padding: 16px; }
+            .search-modal-body { padding: 14px 14px 16px; }
+            .search-results-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+        }
+        @media (max-width: 400px) {
+            .wordmark h1 { font-size: 20px; }
+            .marquee-bar { padding: 10px 12px; }
+            .layout { padding: 10px; gap: 14px; }
+            .landing-card { padding: 26px 16px 20px; }
+            .room-code-value { font-size: 22px; }
         }
         /* iOS zooms the page on focus if inputs are smaller than 16px — keep all form fields at 16px on touch widths */
         @media (max-width: 980px) {
